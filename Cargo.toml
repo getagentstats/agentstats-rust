@@ -1,0 +1,51 @@
+[package]
+name = "agentstats"
+version = "0.1.0"
+edition = "2024"
+description = "AgentStats analytics for Rust MCP servers (rmcp) and CLIs (clap). Never blocks a request."
+license = "MIT"
+readme = "README.md"
+homepage = "https://agentstats.io"
+repository = "https://github.com/getagentstats/agentstats-rust"
+documentation = "https://docs.rs/agentstats"
+keywords = ["mcp", "analytics", "ai-agents", "cli", "telemetry"]
+categories = ["development-tools", "command-line-interface"]
+
+[dependencies]
+rand = "0.10.3"
+rmcp = { version = "3.8.0", features = ["server", "client", "macros"], optional = true }
+http = { version = "1", optional = true }
+clap = { version = "4.5", default-features = false, features = ["std", "error-context"], optional = true }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = "3"
+
+[features]
+default = ["mcp"]
+# MCP server analytics for rmcp.
+mcp = ["dep:rmcp", "dep:http"]
+# One-call integration for clap CLIs (agentstats::cli is always available).
+clap = ["dep:clap"]
+
+[dev-dependencies]
+clap = { version = "4.5", features = ["derive"] }
+# Streamable HTTP with an auth layer, for the sign-in test.
+rmcp = { version = "3.8.0", features = ["server", "client", "macros", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
+axum = "0.8"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
+
+[[test]]
+name = "rmcp"
+required-features = ["mcp"]
+
+[[test]]
+name = "oauth"
+required-features = ["mcp"]
+
+[[test]]
+name = "cli_clap"
+required-features = ["clap"]
+
+[[example]]
+name = "shipit"
+required-features = ["clap"]
