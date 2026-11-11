@@ -15,7 +15,7 @@
 //!
 //! Recording a call is a timestamp and a push under a short mutex. A background thread
 //! ships batches; on failure events are dropped, never retried inline, and nothing is
-//! returned to your server. Tool arguments and results are never sent. See https://github.com/getagentstats/spec/blob/main/PROTOCOL.md.
+//! returned to your server. Tool arguments and results are never sent. See <https://github.com/getagentstats/spec/blob/main/PROTOCOL.md>.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -75,7 +75,7 @@ impl std::fmt::Debug for AuthInfoFn {
     }
 }
 
-/// What's kept of a validated token (https://github.com/getagentstats/spec/blob/main/PROTOCOL.md "Sign-in"): the client app by its Client ID
+/// What's kept of a validated token (<https://github.com/getagentstats/spec/blob/main/PROTOCOL.md>, "Sign-in"): the client app by its Client ID
 /// Metadata Document URL (https, with a path, no credentials or query), else "registered"
 /// (Dynamic Client Registration ids are random per installation), and the granted scopes,
 /// de-duplicated, sorted, at most 20 of at most 80 chars. Never the token or the user.

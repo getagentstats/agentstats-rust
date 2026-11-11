@@ -34,6 +34,9 @@ rmcp = { version = "3.8.0", features = ["server", "client", "macros", "transport
 axum = "0.8"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-util", "time"] }
 
+[package.metadata.docs.rs]
+all-features = true
+
 [[test]]
 name = "rmcp"
 required-features = ["mcp"]
