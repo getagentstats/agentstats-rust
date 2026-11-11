@@ -1,9 +1,12 @@
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use agentstats::{AgentStats, Options};
+use common::sending_to;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities, ClientConfig,
     ContentBlock, Implementation, InitializeResult, ListToolsResult, PaginatedRequestParams,
@@ -86,10 +89,9 @@ fn capture(delay: Duration) -> (String, Arc<Mutex<Vec<Value>>>) {
     (url, bodies)
 }
 
-fn opts(endpoint: &str) -> Options {
+fn opts() -> Options {
     Options {
         api_key: Some("al_srv_test".into()),
-        endpoint: endpoint.into(),
         flush_interval: Duration::from_secs(3600),
         ..Options::default()
     }
@@ -114,7 +116,7 @@ async fn connect(
 #[tokio::test(flavor = "multi_thread")]
 async fn records_calls_errors_client_and_catalog() {
     let (url, bodies) = capture(Duration::ZERO);
-    let service = AgentStats::new(Fixture, opts(&url));
+    let service = sending_to(&url, || AgentStats::new(Fixture, opts()));
     let tracker = service.tracker().clone();
     let client = connect(service).await;
     client.list_all_tools().await.unwrap();
@@ -166,14 +168,16 @@ async fn records_calls_errors_client_and_catalog() {
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_endpoint_never_blocks() {
     let (url, _) = capture(Duration::from_secs(3));
-    let service = AgentStats::new(
-        Fixture,
-        Options {
-            flush_interval: Duration::from_millis(10),
-            max_batch: 1,
-            ..opts(&url)
-        },
-    );
+    let service = sending_to(&url, || {
+        AgentStats::new(
+            Fixture,
+            Options {
+                flush_interval: Duration::from_millis(10),
+                max_batch: 1,
+                ..opts()
+            },
+        )
+    });
     let client = connect(service).await;
     let started = Instant::now();
     for _ in 0..50 {
@@ -191,14 +195,16 @@ async fn slow_endpoint_never_blocks() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn dead_endpoint_bounds_buffer() {
-    let service = AgentStats::new(
-        Fixture,
-        Options {
-            max_buffer: 100,
-            max_batch: 100_000,
-            ..opts("http://127.0.0.1:1")
-        },
-    );
+    let service = sending_to("http://127.0.0.1:1", || {
+        AgentStats::new(
+            Fixture,
+            Options {
+                max_buffer: 100,
+                max_batch: 100_000,
+                ..opts()
+            },
+        )
+    });
     let tracker = service.tracker().clone();
     let client = connect(service).await;
     for _ in 0..300 {
@@ -219,7 +225,7 @@ fn no_key_is_noop() {
     assert!(!t.enabled());
 }
 
-/// AGENTSTATS_E2E=1 AGENTSTATS_MCP_KEY=al_srv_... AGENTSTATS_ENDPOINT=http://localhost:3000/api/ingest/mcp cargo test e2e -- --nocapture
+/// AGENTSTATS_E2E=1 AGENTSTATS_MCP_KEY=al_srv_... AGENTSTATS_URL=http://localhost:3000 cargo test e2e -- --nocapture
 #[tokio::test(flavor = "multi_thread")]
 async fn e2e_local() {
     if std::env::var("AGENTSTATS_E2E").as_deref() != Ok("1") {
@@ -322,7 +328,7 @@ async fn e2e_local() {
 async fn capture_errors_off_or_a_function() {
     async fn error_of(opts: Options) -> Value {
         let (url, bodies) = capture(Duration::ZERO);
-        let service = AgentStats::new(Fixture, Options { endpoint: url, ..opts });
+        let service = sending_to(&url, || AgentStats::new(Fixture, opts));
         let tracker = service.tracker().clone();
         let client = connect(service).await;
         client
@@ -340,13 +346,123 @@ async fn capture_errors_off_or_a_function() {
         assert_eq!(call["isError"], true);
         call["errorMessage"].clone()
     }
-    let off = error_of(Options { capture_errors: false, ..opts("") }).await;
+    let off = error_of(Options {
+        capture_errors: false,
+        ..opts()
+    })
+    .await;
     assert!(off.is_null());
-    let kept = error_of(opts("").capture_errors_with(|e| {
-        Some(format!("{} failed: {}", e.tool.as_deref().unwrap_or("?"), e.message.split(':').next().unwrap()))
+    let kept = error_of(opts().capture_errors_with(|e| {
+        Some(format!(
+            "{} failed: {}",
+            e.tool.as_deref().unwrap_or("?"),
+            e.message.split(':').next().unwrap()
+        ))
     }))
     .await;
     assert_eq!(kept, "fail failed: boom");
-    assert!(error_of(opts("").capture_errors_with(|_| None)).await.is_null());
-    assert!(error_of(opts("").capture_errors_with(|_| panic!("bug"))).await.is_null());
+    assert!(
+        error_of(opts().capture_errors_with(|_| None))
+            .await
+            .is_null()
+    );
+    assert!(
+        error_of(opts().capture_errors_with(|_| panic!("bug")))
+            .await
+            .is_null()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reports_failure_kind_and_result_size() {
+    let (url, bodies) = capture(Duration::ZERO);
+    let service = sending_to(&url, || AgentStats::new(Fixture, opts()));
+    let tracker = service.tracker().clone();
+    let client = connect(service).await;
+    client.list_all_tools().await.unwrap();
+    client
+        .call_tool(CallToolRequestParams::new("add"))
+        .await
+        .unwrap();
+    client
+        .call_tool(CallToolRequestParams::new("fail"))
+        .await
+        .unwrap();
+    tracker.shutdown();
+
+    let bodies = bodies.lock().unwrap();
+    let events: Vec<&Value> = bodies
+        .iter()
+        .flat_map(|b| b["events"].as_array().unwrap())
+        .collect();
+    let calls: Vec<&&Value> = events
+        .iter()
+        .filter(|e| e["method"] == "tools/call")
+        .collect();
+    assert_eq!(calls[0]["resultChars"], 2);
+    assert!(calls[0].get("errorKind").is_none());
+    assert_eq!(calls[1]["errorKind"], "tool");
+    assert!(calls[1].get("resultChars").is_none());
+    let list = events.iter().find(|e| e["method"] == "tools/list").unwrap();
+    assert!(list.get("resultChars").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn feedback_tool_is_listed_answered_and_sent() {
+    let (url, bodies) = capture(Duration::ZERO);
+    let service = sending_to(&url, || {
+        AgentStats::new(
+            Fixture,
+            Options {
+                feedback_tool: true,
+                ..opts()
+            },
+        )
+    });
+    let tracker = service.tracker().clone();
+    let client = connect(service).await;
+    let tools = client.list_all_tools().await.unwrap();
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+    assert_eq!(names, ["add", "fail", "send_feedback"]);
+    let reply = client
+        .call_tool(
+            CallToolRequestParams::new("send_feedback").with_arguments(
+                json!({"content": "add rounds decimals", "source": "user", "tool": "add"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    let text = reply.content[0].as_text().unwrap().text.clone();
+    assert!(text.contains("sent to the developers"));
+    tracker.shutdown();
+
+    let bodies = bodies.lock().unwrap();
+    let feedback: Vec<&Value> = bodies
+        .iter()
+        .filter_map(|b| b.get("feedback"))
+        .flat_map(|f| f.as_array().unwrap())
+        .collect();
+    assert_eq!(feedback.len(), 1);
+    assert_eq!(
+        (
+            feedback[0]["content"].as_str(),
+            feedback[0]["source"].as_str(),
+            feedback[0]["tool"].as_str()
+        ),
+        (Some("add rounds decimals"), Some("user"), Some("add"))
+    );
+    let catalog = bodies
+        .iter()
+        .rev()
+        .find_map(|b| b.get("catalog").filter(|c| !c.is_null()))
+        .unwrap();
+    assert_eq!(catalog["tools"].as_array().unwrap().len(), 2);
+    let events: Vec<&Value> = bodies
+        .iter()
+        .flat_map(|b| b["events"].as_array().unwrap())
+        .collect();
+    assert!(!events.iter().any(|e| e["tool"] == "send_feedback"));
 }

@@ -16,3 +16,5 @@ A plain background thread with blocking `ureq` ships batches, so it needs no asy
 ```sh
 cargo test
 ```
+
+`Options { feedback_tool: true, ..Options::default() }` adds a `send_feedback` tool the SDK answers itself, so agents and users can report problems (Feedback, under the server).

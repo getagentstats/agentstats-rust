@@ -26,12 +26,13 @@ use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 #[allow(deprecated)]
 use rmcp::model::*;
-use rmcp::service::{MaybeSendFuture, NotificationContext, RequestContext, RoleServer, SubscriptionContext};
+use rmcp::service::{
+    MaybeSendFuture, NotificationContext, RequestContext, RoleServer, SubscriptionContext,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DEFAULT_ENDPOINT: &str = "https://agentstats.io/api/ingest/mcp";
 /// A failed request, as passed to [`Options::capture_errors_with`].
 #[derive(Clone, Debug)]
 pub struct ErrorInfo {
@@ -86,28 +87,49 @@ pub struct Auth {
 }
 
 pub fn auth_summary(info: &AuthInfo) -> Auth {
-    let client = info.client_id.as_deref().filter(|s| !s.is_empty()).map(|id| {
-        id.strip_prefix("https://")
-            .and_then(|rest| {
-                let (host, path) = rest.split_at(rest.find('/')?);
-                let ok = !host.is_empty() && !host.contains('@') && !id.contains('?') && !id.contains('#') && path.len() > 1;
-                ok.then(|| format!("{host}{path}").chars().take(200).collect::<String>())
-            })
-            .unwrap_or_else(|| "registered".into())
-    });
-    let mut scopes: Vec<String> = info.scopes.iter().filter(|s| !s.is_empty() && s.len() <= 80).cloned().collect();
+    let client = info
+        .client_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|id| {
+            id.strip_prefix("https://")
+                .and_then(|rest| {
+                    let (host, path) = rest.split_at(rest.find('/')?);
+                    let ok = !host.is_empty()
+                        && !host.contains('@')
+                        && !id.contains('?')
+                        && !id.contains('#')
+                        && path.len() > 1;
+                    ok.then(|| {
+                        format!("{host}{path}")
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
+                    })
+                })
+                .unwrap_or_else(|| "registered".into())
+        });
+    let mut scopes: Vec<String> = info
+        .scopes
+        .iter()
+        .filter(|s| !s.is_empty() && s.len() <= 80)
+        .cloned()
+        .collect();
     scopes.sort();
     scopes.dedup();
     scopes.truncate(20);
-    Auth { method: "oauth", client, scopes }
+    Auth {
+        method: "oauth",
+        client,
+        scopes,
+    }
 }
 
-/// Configuration. `Default` reads `AGENTSTATS_MCP_KEY` and `AGENTSTATS_ENDPOINT`.
+/// Configuration. `Default` reads `AGENTSTATS_MCP_KEY`.
 #[derive(Clone, Debug)]
 pub struct Options {
     pub api_key: Option<String>,
     pub server_name: Option<String>,
-    pub endpoint: String,
     /// Fraction of `tools/call` requests recorded.
     pub sample_rate: f64,
     /// Send error messages. `false` keeps only that the request failed.
@@ -115,6 +137,10 @@ pub struct Options {
     /// Set with [`Options::capture_errors_with`].
     pub error_text: Option<ErrorText>,
     pub capture_catalog: bool,
+    /// Add a `send_feedback` tool to the server's tools, answered by the SDK (it never reaches your
+    /// handler), so agents can report a tool that failed them and users can pass something on.
+    /// What they write is sent to AgentStats (Feedback, under the server). Off by default.
+    pub feedback_tool: bool,
     pub flush_interval: Duration,
     pub max_batch: usize,
     pub max_buffer: usize,
@@ -130,12 +156,11 @@ impl Default for Options {
                 .ok()
                 .filter(|s| !s.is_empty()),
             server_name: None,
-            endpoint: std::env::var("AGENTSTATS_ENDPOINT")
-                .unwrap_or_else(|_| DEFAULT_ENDPOINT.into()),
             sample_rate: 1.0,
             capture_errors: true,
             error_text: None,
             capture_catalog: true,
+            feedback_tool: false,
             flush_interval: Duration::from_secs(2),
             max_batch: 250,
             max_buffer: 10_000,
@@ -178,7 +203,9 @@ impl Options {
 /// straight into rmcp's extensions).
 fn request_auth(opts: &Options, ext: &rmcp::model::Extensions) -> Option<Auth> {
     let info = match &opts.auth_info {
-        Some(f) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (f.0)(ext))).ok().flatten(),
+        Some(f) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (f.0)(ext)))
+            .ok()
+            .flatten(),
         None => ext
             .get::<http::request::Parts>()
             .and_then(|p| p.extensions.get::<AuthInfo>())
@@ -196,9 +223,18 @@ struct Event {
     tool: Option<String>,
     duration_ms: f64,
     is_error: bool,
+    /// What failed: "tool" (an isError result) or "protocol" (a JSON-RPC error, with its code).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_kind: Option<&'static str>,
     error_message: Option<String>,
+    /// The JSON-RPC code, for capture_errors_with; sent as `errorCode` for protocol errors.
     #[serde(skip)]
     error_code: Option<i32>,
+    #[serde(rename = "errorCode", skip_serializing_if = "Option::is_none")]
+    wire_error_code: Option<i32>,
+    /// Characters of text a successful tools/call, resources/read or prompts/get result handed the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result_chars: Option<usize>,
     client_name: Option<String>,
     client_version: Option<String>,
     session_id: Option<String>,
@@ -213,6 +249,9 @@ struct State {
     catalog: serde_json::Map<String, Value>,
     catalog_sig: String,
     catalog_dirty: bool,
+    feedback: VecDeque<Value>,
+    /// The server lists a send_feedback tool of its own: leave its calls alone.
+    server_has_feedback: bool,
     dropped: u64,
     inflight: u8,
     stopped: bool,
@@ -226,6 +265,7 @@ pub struct Tracker {
 
 struct TrackerInner {
     opts: Options,
+    endpoint: String,
     enabled: bool,
     state: Mutex<State>,
     wake: Condvar,
@@ -249,6 +289,7 @@ impl Tracker {
         let t = Self {
             inner: Arc::new(TrackerInner {
                 opts,
+                endpoint: crate::ingest_url("mcp"),
                 enabled,
                 state: Mutex::new(state),
                 wake: Condvar::new(),
@@ -398,13 +439,15 @@ impl Tracker {
         if !self.enabled() {
             return Ok(());
         }
-        let (events, catalog, name, dropped) = {
+        let (events, feedback, catalog, name, dropped) = {
             let mut s = self.inner.state.lock().unwrap();
-            if s.inflight >= 2 || (s.buf.is_empty() && !s.catalog_dirty) {
+            if s.inflight >= 2 || (s.buf.is_empty() && !s.catalog_dirty && s.feedback.is_empty()) {
                 return Ok(());
             }
             let n = s.buf.len().min(self.inner.opts.max_batch);
             let events: Vec<Event> = s.buf.drain(..n).collect();
+            let m = s.feedback.len().min(50);
+            let feedback: Vec<Value> = s.feedback.drain(..m).collect();
             let catalog = if s.catalog_dirty {
                 Some(Value::Object(s.catalog.clone()))
             } else {
@@ -415,6 +458,7 @@ impl Tracker {
             let dropped = std::mem::take(&mut s.dropped);
             (
                 events,
+                feedback,
                 catalog,
                 s.server_name
                     .clone()
@@ -426,10 +470,13 @@ impl Tracker {
         if let Some(c) = &catalog {
             body["catalog"] = c.clone();
         }
+        if !feedback.is_empty() {
+            body["feedback"] = Value::Array(feedback);
+        }
         let result = self
             .inner
             .agent
-            .post(&self.inner.opts.endpoint)
+            .post(&self.inner.endpoint)
             .header(
                 "Authorization",
                 &format!(
@@ -471,7 +518,7 @@ impl Tracker {
         for _ in 0..100 {
             let left = {
                 let s = self.inner.state.lock().unwrap();
-                !s.buf.is_empty() || s.catalog_dirty
+                !s.buf.is_empty() || s.catalog_dirty || !s.feedback.is_empty()
             };
             if !left || self.flush().is_err() {
                 return;
@@ -482,6 +529,108 @@ impl Tracker {
     pub fn dropped(&self) -> u64 {
         self.inner.state.lock().unwrap().dropped
     }
+
+    fn feedback_enabled(&self) -> bool {
+        self.enabled() && self.inner.opts.feedback_tool
+    }
+
+    /// Queue what a send_feedback call said. `false` when there's nothing to keep (empty content).
+    fn record_feedback(
+        &self,
+        args: Option<&rmcp::model::JsonObject>,
+        session_id: &str,
+        client: Option<(String, String)>,
+    ) -> bool {
+        let get = |k: &str| {
+            args.and_then(|a| a.get(k))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("")
+        };
+        let mut content = get("content").to_string();
+        if content.is_empty() {
+            return false;
+        }
+        truncate(&mut content, 4000);
+        let mut tool = get("tool").to_string();
+        truncate(&mut tool, 200);
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let item = json!({
+            "ts": ts,
+            "sessionId": session_id,
+            "clientName": client.as_ref().map(|c| c.0.clone()),
+            "clientVersion": client.as_ref().map(|c| c.1.clone()),
+            "source": if get("source") == "user" { "user" } else { "agent" },
+            "tool": if tool.is_empty() { Value::Null } else { Value::String(tool) },
+            "content": content,
+        });
+        {
+            let mut s = self.inner.state.lock().unwrap();
+            if s.feedback.len() >= 100 {
+                s.feedback.pop_front();
+            }
+            s.feedback.push_back(item);
+        }
+        self.ensure_thread();
+        true
+    }
+}
+
+fn truncate(s: &mut String, max: usize) {
+    if s.len() > max {
+        let mut cut = max;
+        while !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
+    }
+}
+
+/// The send_feedback tool (PROTOCOL.md, "Feedback").
+pub const FEEDBACK_TOOL_NAME: &str = "send_feedback";
+const FEEDBACK_TITLE: &str = "Send feedback";
+const FEEDBACK_DESCRIPTION: &str = "Send feedback about this server to the people who build it. Use it when a tool failed, returned something wrong or unhelpful, or when you could not do what the user needed with these tools; or when the user asks you to pass something on. Describe what you tried and what you expected in a few sentences. Leave out personal information, secrets and the user's data.";
+const FEEDBACK_REPLY: &str = "Thanks: your feedback was sent to the developers of this server.";
+const FEEDBACK_EMPTY: &str = "Nothing was sent: `content` is empty.";
+
+fn feedback_tool() -> Tool {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "content": { "type": "string", "description": "What happened and what you expected, in a few sentences." },
+            "source": { "type": "string", "enum": ["user", "agent"], "description": "\"user\" when the user asked you to send it, \"agent\" when you are reporting on your own." },
+            "tool": { "type": "string", "description": "The tool it is about, if it is about one." }
+        },
+        "required": ["content", "source"]
+    });
+    let schema = match schema {
+        Value::Object(m) => m,
+        _ => unreachable!(),
+    };
+    Tool::new(FEEDBACK_TOOL_NAME, FEEDBACK_DESCRIPTION, Arc::new(schema))
+        .with_title(FEEDBACK_TITLE)
+        .with_annotations(
+            ToolAnnotations::with_title(FEEDBACK_TITLE)
+                .read_only(false)
+                .destructive(false)
+                .open_world(false),
+        )
+}
+
+/// Characters of text a content block hands the model.
+fn block_chars(c: &rmcp::model::ContentBlock) -> usize {
+    if let Some(t) = c.as_text() {
+        return t.text.len();
+    }
+    if let Some(r) = c.as_resource()
+        && let rmcp::model::ResourceContents::TextResourceContents { text, .. } = &r.resource
+    {
+        return text.len();
+    }
+    0
 }
 
 /// Wraps an rmcp server handler (anything implementing `Service<RoleServer>`, which every
@@ -532,29 +681,72 @@ impl<S: ServerHandler> AgentStats<S> {
     }
 
     /// Start observing a request, or `None` when it isn't recorded (disabled, or not sampled).
-    fn begin(&self, method: &'static str, tool: Option<String>, context: &RequestContext<RoleServer>) -> Option<Begin> {
+    fn begin(
+        &self,
+        method: &'static str,
+        tool: Option<String>,
+        context: &RequestContext<RoleServer>,
+    ) -> Option<Begin> {
         let t = &self.tracker;
         if !t.enabled() || (method == "tools/call" && !t.sample()) {
             return None;
         }
-        let client = context.client_info().map(|c| (c.name.to_string(), c.version.to_string()));
+        let client = context
+            .client_info()
+            .map(|c| (c.name.to_string(), c.version.to_string()));
         let auth = request_auth(&t.inner.opts, &context.extensions);
         if auth.is_some() {
             *self.auth.lock().unwrap() = auth.clone();
         }
         let auth = auth.or_else(|| self.auth.lock().unwrap().clone());
-        Some(Begin { method, tool, client, auth, started: Instant::now() })
+        Some(Begin {
+            method,
+            tool,
+            client,
+            auth,
+            started: Instant::now(),
+        })
     }
 
-    fn end(&self, b: Begin, is_error: bool, error_message: Option<String>, error_code: Option<i32>) {
+    fn end(
+        &self,
+        b: Begin,
+        is_error: bool,
+        error_message: Option<String>,
+        error_code: Option<i32>,
+    ) {
+        self.end_with(b, is_error, error_message, error_code, None)
+    }
+
+    /// `error_code` is set for JSON-RPC errors only, so an error without one is a tool's isError result.
+    fn end_with(
+        &self,
+        b: Begin,
+        is_error: bool,
+        error_message: Option<String>,
+        error_code: Option<i32>,
+        result_chars: Option<usize>,
+    ) {
+        let kind = match (is_error, error_code) {
+            (false, _) => None,
+            (true, Some(_)) => Some("protocol"),
+            (true, None) => Some("tool"),
+        };
         let event = Event {
             ts: 0,
             method: b.method.to_string(),
             tool: b.tool,
             duration_ms: 0.0,
             is_error,
+            error_kind: kind,
             error_message: if is_error { error_message } else { None },
             error_code,
+            wire_error_code: if kind == Some("protocol") {
+                error_code
+            } else {
+                None
+            },
+            result_chars: if is_error { None } else { result_chars },
             client_name: b.client.as_ref().map(|c| c.0.clone()),
             client_version: b.client.as_ref().map(|c| c.1.clone()),
             session_id: Some(self.session_id.clone()),
@@ -566,7 +758,6 @@ impl<S: ServerHandler> AgentStats<S> {
 
 #[allow(deprecated)]
 impl<S: ServerHandler> ServerHandler for AgentStats<S> {
-
     fn ping(
         &self,
         context: RequestContext<RoleServer>,
@@ -586,7 +777,11 @@ impl<S: ServerHandler> ServerHandler for AgentStats<S> {
                 let (is_error, message, code) = match &result {
                     Err(e) => (true, Some(e.message.to_string()), Some(e.code.0)),
                     Ok(r) => {
-                        self.tracker.set_server_info(&r.server_info.name, &r.server_info.version, r.instructions.as_deref());
+                        self.tracker.set_server_info(
+                            &r.server_info.name,
+                            &r.server_info.version,
+                            r.instructions.as_deref(),
+                        );
                         (false, None, None)
                     }
                 };
@@ -654,7 +849,13 @@ impl<S: ServerHandler> ServerHandler for AgentStats<S> {
                     Err(e) => (true, Some(e.message.to_string()), Some(e.code.0)),
                     Ok(_) => (false, None, None),
                 };
-                self.end(b, is_error, message, code);
+                let chars = match &result {
+                    Ok(GetPromptResponse::Complete(r)) => {
+                        Some(r.messages.iter().map(|m| block_chars(&m.content)).sum())
+                    }
+                    _ => None,
+                };
+                self.end_with(b, is_error, message, code, chars);
             }
             result
         }
@@ -720,7 +921,22 @@ impl<S: ServerHandler> ServerHandler for AgentStats<S> {
                     Err(e) => (true, Some(e.message.to_string()), Some(e.code.0)),
                     Ok(_) => (false, None, None),
                 };
-                self.end(b, is_error, message, code);
+                let chars = match &result {
+                    Ok(ReadResourceResponse::Complete(r)) => Some(
+                        r.contents
+                            .iter()
+                            .map(|c| match c {
+                                rmcp::model::ResourceContents::TextResourceContents {
+                                    text,
+                                    ..
+                                } => text.len(),
+                                _ => 0,
+                            })
+                            .sum(),
+                    ),
+                    _ => None,
+                };
+                self.end_with(b, is_error, message, code, chars);
             }
             result
         }
@@ -761,16 +977,62 @@ impl<S: ServerHandler> ServerHandler for AgentStats<S> {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, McpError>> + MaybeSendFuture + '_ {
-        let begin = self.begin("tools/call", Some(request.name.to_string()), &context);
+        // send_feedback (Options::feedback_tool): answered here, never by the server, and not a tool call.
+        let feedback = (self.tracker.feedback_enabled()
+            && request.name == FEEDBACK_TOOL_NAME
+            && !self.tracker.inner.state.lock().unwrap().server_has_feedback)
+            .then(|| {
+                let client = context
+                    .client_info()
+                    .map(|c| (c.name.to_string(), c.version.to_string()));
+                self.tracker
+                    .record_feedback(request.arguments.as_ref(), &self.session_id, client)
+            });
+        let begin = if feedback.is_some() {
+            None
+        } else {
+            self.begin("tools/call", Some(request.name.to_string()), &context)
+        };
         async move {
+            if let Some(kept) = feedback {
+                let content = vec![ContentBlock::text(if kept {
+                    FEEDBACK_REPLY
+                } else {
+                    FEEDBACK_EMPTY
+                })];
+                return Ok(CallToolResponse::Complete(if kept {
+                    CallToolResult::success(content)
+                } else {
+                    CallToolResult::error(content)
+                }));
+            }
             let result = self.inner.call_tool(request, context).await;
             if let Some(b) = begin {
                 let (is_error, message, code) = match &result {
                     Err(e) => (true, Some(e.message.to_string()), Some(e.code.0)),
-                    Ok(CallToolResponse::Complete(r)) if r.is_error == Some(true) => (true, r.content.iter().find_map(|c| c.as_text().map(|t| t.text.clone())), None),
+                    Ok(CallToolResponse::Complete(r)) if r.is_error == Some(true) => (
+                        true,
+                        r.content
+                            .iter()
+                            .find_map(|c| c.as_text().map(|t| t.text.clone())),
+                        None,
+                    ),
                     Ok(_) => (false, None, None),
                 };
-                self.end(b, is_error, message, code);
+                let chars = match &result {
+                    Ok(CallToolResponse::Complete(r)) => {
+                        let n: usize = r.content.iter().map(block_chars).sum();
+                        Some(if n == 0 {
+                            r.structured_content
+                                .as_ref()
+                                .map_or(0, |v| v.to_string().len())
+                        } else {
+                            n
+                        })
+                    }
+                    _ => None,
+                };
+                self.end_with(b, is_error, message, code, chars);
             }
             result
         }
@@ -783,7 +1045,7 @@ impl<S: ServerHandler> ServerHandler for AgentStats<S> {
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + MaybeSendFuture + '_ {
         let begin = self.begin("tools/list", None, &context);
         async move {
-            let result = self.inner.list_tools(request, context).await;
+            let mut result = self.inner.list_tools(request, context).await;
             if let Some(b) = begin {
                 let (is_error, message, code) = match &result {
                     Err(e) => (true, Some(e.message.to_string()), Some(e.code.0)),
@@ -795,6 +1057,17 @@ impl<S: ServerHandler> ServerHandler for AgentStats<S> {
                     }
                 };
                 self.end(b, is_error, message, code);
+            }
+            // The client's list gets send_feedback; the catalog above keeps the server's own.
+            if self.tracker.feedback_enabled()
+                && let Ok(r) = result.as_mut()
+                && r.next_cursor.is_none()
+            {
+                if r.tools.iter().any(|t| t.name == FEEDBACK_TOOL_NAME) {
+                    self.tracker.inner.state.lock().unwrap().server_has_feedback = true;
+                } else {
+                    r.tools.push(feedback_tool());
+                }
             }
             result
         }

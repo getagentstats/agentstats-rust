@@ -32,7 +32,7 @@ fn binary() -> &'static PathBuf {
 /// A one-file HTTP server: collects each POST body, answers 202.
 fn server() -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/api/ingest/cli", listener.local_addr().unwrap());
+    let url = format!("http://{}", listener.local_addr().unwrap());
     let got = Arc::new(Mutex::new(vec![]));
     let sink = got.clone();
     std::thread::spawn(move || {
@@ -82,7 +82,7 @@ fn run(args: &[&str]) -> (Vec<Value>, Option<Value>, i32, String) {
         .env("PATH", std::env::var("PATH").unwrap())
         .env("HOME", &dir)
         .env("AGENTSTATS_CLI_KEY", "al_cli_test")
-        .env("AGENTSTATS_CLI_ENDPOINT", &url)
+        .env("AGENTSTATS_URL", &url)
         .env("AGENTSTATS_CLI_DIR", &dir)
         .env("AGENTSTATS_CLI_TMP_DIR", dir.with_extension("tmp"))
         .output()
@@ -320,7 +320,7 @@ fn publishes_the_command_list_before_exit() {
         .env("HOME", &dir)
         .env("AGENTSTATS_CLI_KEY", "al_cli_test")
         .env("AGENTSTATS_CLI_PUBLISH_KEY", "al_sec_test")
-        .env("AGENTSTATS_CLI_ENDPOINT", &url)
+        .env("AGENTSTATS_URL", &url)
         .env("AGENTSTATS_CLI_DIR", &dir)
         .output()
         .unwrap();
